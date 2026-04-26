@@ -1,4 +1,4 @@
-import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
+import { type PointerEvent, type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import type { Book, Theme, TocItem } from './db';
 import { ReaderPanel, ReaderSidebar } from './ReaderSidebar';
 import type { PdfReaderBlock } from './pdfHybrid/pdfCoordinates';
@@ -32,6 +32,31 @@ interface Props {
   children: ReactNode;
 }
 
+type MiniPosition = { x: number; y: number };
+
+type DragState = {
+  active: boolean;
+  moved: boolean;
+  pointerId: number | null;
+  startX: number;
+  startY: number;
+  offsetX: number;
+  offsetY: number;
+};
+
+function clampMiniPosition(next: MiniPosition): MiniPosition {
+  const width = window.innerWidth || 1024;
+  const height = window.innerHeight || 768;
+  const handleWidth = 76;
+  const handleHeight = 76;
+  const padding = 10;
+
+  return {
+    x: Math.min(Math.max(next.x, padding), Math.max(padding, width - handleWidth - padding)),
+    y: Math.min(Math.max(next.y, padding), Math.max(padding, height - handleHeight - padding)),
+  };
+}
+
 export function ReaderShell({
   book,
   theme,
@@ -63,49 +88,58 @@ export function ReaderShell({
   const shellRef = useRef<HTMLDivElement>(null);
   const [focusMode, setFocusMode] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [showChrome, setShowChrome] = useState(true);
-  const hideTimerRef = useRef<number | null>(null);
+  const [miniPosition, setMiniPosition] = useState<MiniPosition>({ x: 18, y: 96 });
+  const dragRef = useRef<DragState>({
+    active: false,
+    moved: false,
+    pointerId: null,
+    startX: 0,
+    startY: 0,
+    offsetX: 0,
+    offsetY: 0,
+  });
 
   const locationText = useMemo(() => {
+    const pageText = book.format === 'pdf' ? `Pág. ${currentPage}` : '';
+
     if (currentLabel) {
-      return `${currentLabel}${currentIndex && totalItems ? ` · ${currentIndex} de ${totalItems}` : ''}`;
+      return [
+        currentLabel,
+        pageText,
+        currentIndex && totalItems ? `${currentIndex} de ${totalItems}` : null,
+      ]
+        .filter(Boolean)
+        .join(' · ');
     }
-    return book.format === 'pdf' ? `Página ${currentPage}` : 'Leyendo';
+
+    return book.format === 'pdf' ? pageText : 'Leyendo';
   }, [book.format, currentIndex, currentLabel, currentPage, totalItems]);
 
-  const clearHideTimer = () => {
-    if (hideTimerRef.current) {
-      window.clearTimeout(hideTimerRef.current);
-      hideTimerRef.current = null;
-    }
-  };
-
-  const scheduleChromeHide = () => {
-    clearHideTimer();
-    if (!focusMode) {
-      setShowChrome(true);
-      return;
-    }
-    hideTimerRef.current = window.setTimeout(() => {
-      setShowChrome(false);
-    }, 1800);
-  };
-
-  const revealChrome = () => {
-    setShowChrome(true);
-    scheduleChromeHide();
-  };
-
   useEffect(() => {
-    if (!focusMode) {
-      clearHideTimer();
-      setShowChrome(true);
-      return;
-    }
-    scheduleChromeHide();
-    return clearHideTimer;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focusMode]);
+    const updateViewportHeight = () => {
+      const candidates = [
+        window.visualViewport?.height,
+        document.documentElement.clientHeight,
+        window.innerHeight,
+      ].filter((value): value is number => Number.isFinite(value) && value > 0);
+
+      const height = Math.round(Math.min(...candidates));
+      document.documentElement.style.setProperty('--reader-viewport-height', `${height}px`);
+      shellRef.current?.style.setProperty('--reader-viewport-height', `${height}px`);
+      setMiniPosition((current) => clampMiniPosition(current));
+    };
+
+    updateViewportHeight();
+    window.addEventListener('resize', updateViewportHeight);
+    window.visualViewport?.addEventListener('resize', updateViewportHeight);
+    window.visualViewport?.addEventListener('scroll', updateViewportHeight);
+
+    return () => {
+      window.removeEventListener('resize', updateViewportHeight);
+      window.visualViewport?.removeEventListener('resize', updateViewportHeight);
+      window.visualViewport?.removeEventListener('scroll', updateViewportHeight);
+    };
+  }, []);
 
   useEffect(() => {
     const onFsChange = () => {
@@ -116,6 +150,15 @@ export function ReaderShell({
     document.addEventListener('fullscreenchange', onFsChange);
     return () => document.removeEventListener('fullscreenchange', onFsChange);
   }, []);
+
+  const openSidebar = () => {
+    setSidebarOpen(true);
+  };
+
+  const closeSidebar = () => {
+    setShowSettings(false);
+    setSidebarOpen(false);
+  };
 
   const focusSearch = () => {
     setSidebarOpen(true);
@@ -173,9 +216,15 @@ export function ReaderShell({
         onIncreaseFont();
       }
       if (e.key === 'Escape') {
+        if (showSettings) {
+          setShowSettings(false);
+          return;
+        }
+        if (sidebarOpen) {
+          closeSidebar();
+          return;
+        }
         setFocusMode(false);
-        setShowSettings(false);
-        setSidebarOpen(false);
       }
     };
 
@@ -189,6 +238,8 @@ export function ReaderShell({
     setActivePanel,
     setShowSettings,
     setSidebarOpen,
+    showSettings,
+    sidebarOpen,
   ]);
 
   const toggleFullscreen = async () => {
@@ -206,109 +257,174 @@ export function ReaderShell({
     }
   };
 
+  const handleMiniPointerDown = (event: PointerEvent<HTMLButtonElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    dragRef.current = {
+      active: true,
+      moved: false,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const handleMiniPointerMove = (event: PointerEvent<HTMLButtonElement>) => {
+    const drag = dragRef.current;
+    if (!drag.active || drag.pointerId !== event.pointerId) return;
+
+    const deltaX = Math.abs(event.clientX - drag.startX);
+    const deltaY = Math.abs(event.clientY - drag.startY);
+    if (deltaX > 4 || deltaY > 4) drag.moved = true;
+
+    setMiniPosition(clampMiniPosition({
+      x: event.clientX - drag.offsetX,
+      y: event.clientY - drag.offsetY,
+    }));
+  };
+
+  const handleMiniPointerUp = (event: PointerEvent<HTMLButtonElement>) => {
+    const drag = dragRef.current;
+    if (!drag.active || drag.pointerId !== event.pointerId) return;
+
+    try {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    } catch {}
+
+    dragRef.current = {
+      active: false,
+      moved: false,
+      pointerId: null,
+      startX: 0,
+      startY: 0,
+      offsetX: 0,
+      offsetY: 0,
+    };
+
+    if (!drag.moved) openSidebar();
+  };
+
   return (
     <div
       ref={shellRef}
-      className={`reader-page ${focusMode ? 'focus-mode' : ''} ${showChrome ? 'chrome-visible' : 'chrome-hidden'} ${sidebarOpen ? 'has-sidebar' : ''}`}
+      className={`reader-page reader-shell-v14 ${focusMode ? 'focus-mode' : ''} chrome-visible ${sidebarOpen ? 'has-sidebar' : 'drawer-collapsed'}`}
       data-reader-theme={theme}
-      onMouseMove={revealChrome}
-      onTouchStart={revealChrome}
     >
       <div className="reader-ambient-glow" aria-hidden="true" />
 
-      <header className="reader-header chrome-layer">
-        <div className="reader-left-actions">
-          <button
-            className="reader-icon-btn"
-            onClick={() => setSidebarOpen(!sidebarOpen)}
-            aria-label="Abrir tabla de contenidos"
-            aria-expanded={sidebarOpen}
-            type="button"
-            title="Contenido"
-          >
-            ☰
-          </button>
-          <button className="reader-btn ghost" onClick={onBack} aria-label="Volver a biblioteca">
-            ← Biblioteca
-          </button>
-        </div>
-
-        <div className="reader-title">
-          <span className="title">{book.title}</span>
-          <span className="author">{book.author}</span>
-          <span className="reader-location">{locationText}</span>
-        </div>
-
-        <div className="reader-actions">
-          {readingTimeRemaining ? (
-            <span className="reader-time-left">{readingTimeRemaining}</span>
-          ) : null}
-          <span className="reader-progress">{progress.toFixed(0)}%</span>
-          <button
-            className={`reader-icon-btn ${focusMode ? 'active' : ''}`}
-            onClick={() => setFocusMode((prev) => !prev)}
-            type="button"
-            title="Modo enfoque (M)"
-            aria-pressed={focusMode}
-          >
-            ◱
-          </button>
-          <button
-            className={`reader-icon-btn ${isFullscreen ? 'active' : ''}`}
-            onClick={toggleFullscreen}
-            type="button"
-            title="Pantalla completa (F)"
-            aria-pressed={isFullscreen}
-          >
-            ⛶
-          </button>
-          <button
-            className={`reader-icon-btn ${showSettings ? 'active' : ''}`}
-            onClick={() => setShowSettings(!showSettings)}
-            aria-label="Ajustes"
-            aria-expanded={showSettings}
-            type="button"
-            title="Ajustes"
-          >
-            ⚙
-          </button>
-        </div>
-      </header>
-
-      {showSettings ? <div className="chrome-layer">{settings}</div> : null}
+      {!sidebarOpen ? (
+        <button
+          className="reader-floating-menu-handle"
+          type="button"
+          style={{ left: miniPosition.x, top: miniPosition.y }}
+          onPointerDown={handleMiniPointerDown}
+          onPointerMove={handleMiniPointerMove}
+          onPointerUp={handleMiniPointerUp}
+          aria-label="Abrir controles del lector"
+          title="Arrastra para mover · Click para abrir controles"
+        >
+          <span aria-hidden="true">☰</span>
+          <small>{book.format === 'pdf' ? `Pág. ${currentPage}` : `${progress.toFixed(0)}%`}</small>
+        </button>
+      ) : null}
 
       <div className="reader-shell-body">
-        <ReaderSidebar
-          open={sidebarOpen}
-          activePanel={activePanel}
-          setActivePanel={setActivePanel}
-          bookId={book.id}
-          tocItems={tocItems}
-          activeTocItem={activeTocItem}
-          activeTocItemId={activeTocItemId}
-          currentPage={currentPage}
-          smartBlocksByPage={smartBlocksByPage}
-          onTocSelect={onTocSelect}
-          onPageSelect={onPageSelect}
-          chromeVisible={showChrome || !focusMode}
-        />
+        {sidebarOpen ? (
+          <aside className="reader-control-drawer reader-sidebar open chrome-visible" aria-label="Controles del lector">
+            <header className="reader-header reader-drawer-header chrome-layer">
+              <div className="reader-drawer-header-row">
+                <button
+                  className="reader-icon-btn"
+                  onClick={closeSidebar}
+                  aria-label="Contraer controles"
+                  type="button"
+                  title="Contraer a icono flotante"
+                >
+                  ×
+                </button>
+                <button className="reader-btn ghost reader-back-btn" onClick={onBack} aria-label="Volver a biblioteca" type="button">
+                  ← Biblioteca
+                </button>
+                <span className="reader-progress">{progress.toFixed(0)}%</span>
+              </div>
+
+              <div className="reader-title reader-drawer-title">
+                <span className="title">{book.title}</span>
+                <span className="author">{book.author}</span>
+                <span className="reader-location">{locationText}</span>
+              </div>
+
+              <div className="reader-actions reader-drawer-actions">
+                {readingTimeRemaining ? (
+                  <span className="reader-time-left">{readingTimeRemaining}</span>
+                ) : null}
+                <button
+                  className={`reader-icon-btn ${focusMode ? 'active' : ''}`}
+                  onClick={() => setFocusMode((prev) => !prev)}
+                  type="button"
+                  title="Modo enfoque (M)"
+                  aria-pressed={focusMode}
+                >
+                  ◱
+                </button>
+                <button
+                  className={`reader-icon-btn ${isFullscreen ? 'active' : ''}`}
+                  onClick={toggleFullscreen}
+                  type="button"
+                  title="Pantalla completa (F)"
+                  aria-pressed={isFullscreen}
+                >
+                  ⛶
+                </button>
+                <button
+                  className={`reader-icon-btn ${showSettings ? 'active' : ''}`}
+                  onClick={() => setShowSettings(!showSettings)}
+                  aria-label="Ajustes"
+                  aria-expanded={showSettings}
+                  type="button"
+                  title="Ajustes"
+                >
+                  ⚙
+                </button>
+                <button
+                  className="reader-icon-btn"
+                  onClick={onToggleBookmark}
+                  type="button"
+                  title="Bookmark (B)"
+                  aria-label="Añadir o quitar marcador"
+                >
+                  ⌑
+                </button>
+              </div>
+            </header>
+
+            {showSettings ? <div className="reader-drawer-settings-panel">{settings}</div> : null}
+
+            <ReaderSidebar
+              open
+              activePanel={activePanel}
+              setActivePanel={setActivePanel}
+              bookId={book.id}
+              tocItems={tocItems}
+              activeTocItem={activeTocItem}
+              activeTocItemId={activeTocItemId}
+              currentPage={currentPage}
+              smartBlocksByPage={smartBlocksByPage}
+              onTocSelect={onTocSelect}
+              onPageSelect={onPageSelect}
+              chromeVisible
+            />
+          </aside>
+        ) : null}
+
         <main className="reader-content">{children}</main>
       </div>
 
       <div className="reader-bottom-progress chrome-layer" aria-hidden="true">
         <span style={{ width: `${Math.min(100, Math.max(0, progress))}%` }} />
       </div>
-
-      {focusMode ? (
-        <button
-          className={`focus-pill ${showChrome ? 'visible' : ''}`}
-          type="button"
-          onClick={() => setFocusMode(false)}
-          title="Salir de modo enfoque"
-        >
-          Modo enfoque · mueve el mouse para mostrar controles
-        </button>
-      ) : null}
     </div>
   );
 }

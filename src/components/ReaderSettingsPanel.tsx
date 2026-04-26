@@ -42,7 +42,9 @@ export function ReaderSettingsPanel({
   speedReadingDisabled,
 }: ReaderSettingsPanelProps) {
   return (
-    <div className="reader-settings premium-settings">
+    <section className="reader-settings premium-settings" aria-label="Ajustes de lectura">
+      <div className="settings-section-title">Lectura</div>
+
       <label>
         Tamaño de fuente
         <strong>{fontSize}px</strong>
@@ -86,16 +88,20 @@ export function ReaderSettingsPanel({
       </label>
 
       {bookFormat === 'pdf' ? (
-        <label>
-          Modo PDF
-          <select value={pdfReadingMode} onChange={(e) => onPdfReadingModeChange(e.target.value as 'page' | 'text' | 'smart')}>
-            <option value="page">Página original</option>
-            <option value="text">Texto tipo ebook</option>
-            <option value="smart">Smart Reader</option>
-          </select>
-        </label>
+        <>
+          <div className="settings-section-title">Documento</div>
+          <label>
+            Modo PDF
+            <select value={pdfReadingMode} onChange={(e) => onPdfReadingModeChange(e.target.value as 'page' | 'text' | 'smart')}>
+              <option value="page">Página original</option>
+              <option value="text">Texto tipo ebook</option>
+              <option value="smart">Smart Reader</option>
+            </select>
+          </label>
+        </>
       ) : null}
 
+      <div className="settings-section-title">Herramientas</div>
       <div className="reader-settings-actions">
         <button type="button" onClick={onOpenReview}>Modo repaso</button>
         <button type="button" onClick={onOpenFlashcards}>Flashcards</button>
@@ -103,10 +109,10 @@ export function ReaderSettingsPanel({
         <button type="button" onClick={onOpenSpeedReading} disabled={speedReadingDisabled}>Lectura rápida</button>
       </div>
 
-      <div className="reader-shortcuts-card">
-        <span className="reader-shortcuts-title">Atajos</span>
+      <details className="reader-shortcuts-card">
+        <summary className="reader-shortcuts-title">Atajos</summary>
         <span>F pantalla completa · M enfoque · N/H notas · B bookmark · / buscar · Ctrl+F buscar · [ ] fuente · ← → pasar página · + − zoom</span>
-      </div>
-    </div>
+      </details>
+    </section>
   );
 }

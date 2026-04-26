@@ -15,6 +15,48 @@ interface ExtractArgs {
   pageNumber: number;
 }
 
+function joinParagraphLines(lines: PdfTextLine[]) {
+  let result = '';
+  let previousLine: PdfTextLine | null = null;
+
+  for (const line of lines) {
+    const text = normalizeText(line.text);
+    if (!text) continue;
+
+    if (!previousLine) {
+      result = text;
+      previousLine = line;
+      continue;
+    }
+
+    const verticalGap = line.y - previousLine.y;
+    const indentJump = Math.abs(line.x - previousLine.x);
+    const previousText = normalizeText(previousLine.text);
+    const previousLooksShort = previousText.length < 58;
+    const startsStructuredLine = /^([-•*]|\d+(\.\d+)*\s|[A-Z]\.\d*\s)/.test(text);
+    const looksLikeTocEntry = /\s\d{1,4}$/.test(text);
+    const previousEndsSoft = /[-–—,:;]$/.test(previousText);
+
+    const shouldBreak =
+      verticalGap > previousLine.height * 1.22 ||
+      indentJump > 16 ||
+      startsStructuredLine ||
+      looksLikeTocEntry ||
+      (previousLooksShort && !previousEndsSoft);
+
+    result += shouldBreak ? `\n${text}` : ` ${text}`;
+    previousLine = line;
+  }
+
+  return result.trim();
+}
+
+function isTocLikePage(lines: PdfTextLine[]) {
+  if (lines.length < 8) return false;
+  const tocLikeLines = lines.filter((line) => /\s\d{1,4}$/.test(normalizeText(line.text))).length;
+  return tocLikeLines / lines.length >= 0.38;
+}
+
 function buildTextBlock(args: {
   bookId: string;
   pageNumber: number;
@@ -25,7 +67,7 @@ function buildTextBlock(args: {
 }): PdfReaderBlock {
   const text = args.type === 'code'
     ? args.lines.map((line) => line.text).join('\n')
-    : normalizeText(args.lines.map((line) => line.text).join(' '));
+    : joinParagraphLines(args.lines);
 
   return {
     id: `${args.bookId}-${args.pageNumber}-${args.order}-${args.type}`,
@@ -128,6 +170,20 @@ export async function extractPdfBlocks({ bookId, pdfPage, pageNumber }: ExtractA
       sourceRect: rect,
       order: 0,
     }];
+  }
+
+  if (isTocLikePage(analysis.lines)) {
+    return analysis.lines
+      .map((line, index) => ({
+        id: `${bookId}-${pageNumber}-${index}-toc-entry`,
+        bookId,
+        page: pageNumber,
+        type: 'paragraph' as ReaderBlockType,
+        text: normalizeText(line.text),
+        sourceRect: lineToRect(line),
+        order: index,
+      }))
+      .filter((block) => block.text.length > 0);
   }
 
   const ignoredLineIndexes = new Set<number>();

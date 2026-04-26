@@ -298,7 +298,7 @@ export function Library({ theme, setTheme }: Props) {
     });
     if (!ok) return;
 
-    await db.transaction(
+    await (db as any).transaction(
       'rw',
       db.books,
       db.files,

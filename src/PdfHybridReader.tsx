@@ -101,6 +101,33 @@ function findBlockElement(pageEl: HTMLElement | null, blockId?: string): HTMLEle
     .find((element) => element.dataset.blockId === blockId) || null;
 }
 
+function getMostVisiblePage(root: HTMLElement | null, pageElements: Map<number, HTMLElement>): number | undefined {
+  if (!root || pageElements.size === 0) return undefined;
+
+  const rootRect = root.getBoundingClientRect();
+  const rootMiddle = rootRect.top + rootRect.height * 0.42;
+  let best: { page: number; score: number; distance: number } | undefined;
+
+  for (const [page, element] of pageElements) {
+    const rect = element.getBoundingClientRect();
+    const visibleTop = Math.max(rect.top, rootRect.top);
+    const visibleBottom = Math.min(rect.bottom, rootRect.bottom);
+    const visiblePx = Math.max(0, visibleBottom - visibleTop);
+
+    if (visiblePx <= 0) continue;
+
+    const visibleRatio = visiblePx / Math.max(rect.height, 1);
+    const distance = Math.abs((rect.top + rect.height / 2) - rootMiddle);
+    const score = visibleRatio * 1000 - distance * 0.2;
+
+    if (!best || score > best.score || (score === best.score && distance < best.distance)) {
+      best = { page, score, distance };
+    }
+  }
+
+  return best?.page;
+}
+
 function renderTextWithHighlights(text: string, highlights: Highlight[]): ReactNode {
   const activeHighlights = highlights
     .filter((highlight) => highlight.text.trim().length > 0)
@@ -186,6 +213,11 @@ export function PdfHybridReader({
   const pendingScrollBlockRef = useRef<string | null>(initialBlockId || null);
   const currentPageRef = useRef(initialPage);
   const totalPagesRef = useRef(0);
+  const maxRequestedPageRef = useRef(Math.max(initialPage, PAGE_BATCH_SIZE));
+  const observerRef = useRef<IntersectionObserver | null>(null);
+  const observedPageElementsRef = useRef<Map<number, HTMLElement>>(new Map());
+  const suppressObserverUntilRef = useRef(0);
+  const scrollRetryTimersRef = useRef<number[]>([]);
 
   const [pages, setPages] = useState<Record<number, PdfHybridPage>>({});
   const [totalPages, setTotalPages] = useState(0);
@@ -196,6 +228,11 @@ export function PdfHybridReader({
   const [selectionPopup, setSelectionPopup] = useState<SelectionPopupState | null>(null);
   const [highlightsByBlock, setHighlightsByBlock] = useState<Record<string, Highlight[]>>({});
   const [highlightRefreshNonce, setHighlightRefreshNonce] = useState(0);
+  const [pendingScrollTarget, setPendingScrollTarget] = useState<{ page: number; blockId?: string | null; token: number } | null>(() => ({
+    page: initialPage,
+    blockId: initialBlockId || null,
+    token: Date.now(),
+  }));
 
   useEffect(() => {
     onPageChangeRef.current = onPageChange;
@@ -220,6 +257,37 @@ export function PdfHybridReader({
   useEffect(() => {
     totalPagesRef.current = totalPages;
   }, [totalPages]);
+
+  useEffect(() => {
+    maxRequestedPageRef.current = maxRequestedPage;
+  }, [maxRequestedPage]);
+
+  const clearScrollRetryTimers = useCallback(() => {
+    scrollRetryTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
+    scrollRetryTimersRef.current = [];
+  }, []);
+
+  const commitVisiblePage = useCallback((nextPage: number, options?: { persist?: boolean }) => {
+    if (!Number.isFinite(nextPage) || nextPage <= 0) return;
+
+    currentPageRef.current = nextPage;
+    setCurrentPage((current) => (current === nextPage ? current : nextPage));
+
+    const total = totalPagesRef.current || 1;
+    if (options?.persist !== false) {
+      onPageChangeRef.current?.(nextPage, total);
+    }
+
+    const currentSection = [...tocItemsRef.current]
+      .filter((item) => item.page && item.page <= nextPage)
+      .sort((a, b) => (b.page || 0) - (a.page || 0))[0];
+    onTocItemChangeRef.current?.(currentSection);
+
+    const maxPage = maxRequestedPageRef.current;
+    if (nextPage >= maxPage - 1 && totalPagesRef.current > maxPage) {
+      setMaxRequestedPage((current) => Math.min(totalPagesRef.current, current + PAGE_BATCH_SIZE));
+    }
+  }, []);
 
   const persistExactPosition = useCallback(() => {
     const page = currentPageRef.current;
@@ -299,6 +367,9 @@ export function PdfHybridReader({
     loadingPagesRef.current.clear();
     pendingScrollPageRef.current = initialPage;
     pendingScrollBlockRef.current = initialBlockId || null;
+    suppressObserverUntilRef.current = Date.now() + 1500;
+    clearScrollRetryTimers();
+    setPendingScrollTarget({ page: initialPage, blockId: initialBlockId || null, token: Date.now() });
 
     const loadDocument = async () => {
       try {
@@ -339,12 +410,16 @@ export function PdfHybridReader({
       persistExactPosition();
       for (const url of objectUrlsRef.current) URL.revokeObjectURL(url);
       objectUrlsRef.current.clear();
+      clearScrollRetryTimers();
+      observerRef.current?.disconnect();
+      observerRef.current = null;
+      observedPageElementsRef.current.clear();
       try {
         pdfRef.current?.destroy();
       } catch {}
       pdfRef.current = null;
     };
-  }, [bookId, fileBlob, initialBlockId, initialPage, loadRange, persistExactPosition]);
+  }, [bookId, clearScrollRetryTimers, fileBlob, initialBlockId, initialPage, loadRange, persistExactPosition]);
 
   useEffect(() => {
     if (!totalPages || loadingDocument) return;
@@ -386,53 +461,105 @@ export function PdfHybridReader({
     };
   }, [bookId, pages, highlightRefreshNonce]);
 
-  useEffect(() => {
-    const targetPage = pendingScrollPageRef.current;
-    if (!targetPage) return;
-    const page = pages[targetPage];
-    if (page?.status !== 'ready') return;
-
-    window.setTimeout(() => {
-      const pageElement = pageRefs.current[targetPage];
-      const blockElement = findBlockElement(pageElement, pendingScrollBlockRef.current || undefined);
-      (blockElement || pageElement)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      pendingScrollPageRef.current = null;
-      pendingScrollBlockRef.current = null;
-    }, 80);
+  const sortedPages = useMemo(() => {
+    return Object.values(pages).sort((a, b) => a.page - b.page);
   }, [pages]);
+
+  const pendingTargetStatus = pendingScrollTarget ? pages[pendingScrollTarget.page]?.status : undefined;
+  const renderedPageNumbersKey = useMemo(() => sortedPages.map((page) => page.page).join('|'), [sortedPages]);
 
   useEffect(() => {
     const root = containerRef.current;
-    if (!root) return;
-    const visiblePages = Object.values(pageRefs.current).filter(Boolean) as HTMLElement[];
-    if (visiblePages.length === 0) return;
+    if (!root || loadingDocument) return;
 
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const visible = entries
-          .filter((entry) => entry.isIntersecting)
-          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+    observerRef.current?.disconnect();
+    observedPageElementsRef.current.clear();
 
-        if (!visible) return;
-        const nextPage = Number((visible.target as HTMLElement).dataset.page || 1);
-        setCurrentPage(nextPage);
-        onPageChangeRef.current?.(nextPage, totalPages || 1);
+    observerRef.current = new IntersectionObserver(
+      () => {
+        if (Date.now() < suppressObserverUntilRef.current || pendingScrollPageRef.current) return;
 
-        const currentSection = [...tocItemsRef.current]
-          .filter((item) => item.page && item.page <= nextPage)
-          .sort((a, b) => (b.page || 0) - (a.page || 0))[0];
-        onTocItemChangeRef.current?.(currentSection);
+        const visiblePage = getMostVisiblePage(root, observedPageElementsRef.current);
+        if (!visiblePage) return;
 
-        if (nextPage >= maxRequestedPage - 1 && totalPages > maxRequestedPage) {
-          setMaxRequestedPage((current) => Math.min(totalPages, current + PAGE_BATCH_SIZE));
-        }
+        commitVisiblePage(visiblePage);
       },
-      { root, threshold: [0.2, 0.45, 0.7] }
+      { root, threshold: [0, 0.25, 0.5, 0.75, 1] }
     );
 
-    visiblePages.forEach((element) => observer.observe(element));
-    return () => observer.disconnect();
-  }, [pages, maxRequestedPage, totalPages]);
+    return () => {
+      observerRef.current?.disconnect();
+      observerRef.current = null;
+      observedPageElementsRef.current.clear();
+    };
+  }, [commitVisiblePage, loadingDocument]);
+
+  useEffect(() => {
+    const observer = observerRef.current;
+    if (!observer) return;
+
+    const renderedPageNumbers = renderedPageNumbersKey
+      ? renderedPageNumbersKey.split('|').map((page) => Number(page)).filter(Number.isFinite)
+      : [];
+    const renderedPages = new Set(renderedPageNumbers);
+
+    for (const [pageNumber, element] of observedPageElementsRef.current) {
+      if (!renderedPages.has(pageNumber)) {
+        observer.unobserve(element);
+        observedPageElementsRef.current.delete(pageNumber);
+      }
+    }
+
+    for (const pageNumber of renderedPageNumbers) {
+      const element = pageRefs.current[pageNumber];
+      if (!element || observedPageElementsRef.current.get(pageNumber) === element) continue;
+
+      const previousElement = observedPageElementsRef.current.get(pageNumber);
+      if (previousElement) observer.unobserve(previousElement);
+
+      observedPageElementsRef.current.set(pageNumber, element);
+      observer.observe(element);
+    }
+  }, [renderedPageNumbersKey]);
+
+  useEffect(() => {
+    if (!pendingScrollTarget || pendingTargetStatus !== 'ready') return;
+
+    const targetPage = pendingScrollTarget.page;
+    const targetBlockId = pendingScrollTarget.blockId || undefined;
+    clearScrollRetryTimers();
+    suppressObserverUntilRef.current = Date.now() + 1800;
+
+    const scrollToTarget = (attempt: number) => {
+      const pageElement = pageRefs.current[targetPage];
+      const blockElement = findBlockElement(pageElement, targetBlockId);
+      const targetElement = blockElement || pageElement;
+      if (!targetElement) return;
+
+      targetElement.scrollIntoView({ behavior: 'auto', block: 'start' });
+      commitVisiblePage(targetPage);
+
+      if (attempt < 5) {
+        const timerId = window.setTimeout(() => scrollToTarget(attempt + 1), 120 + attempt * 80);
+        scrollRetryTimersRef.current.push(timerId);
+        return;
+      }
+
+      pendingScrollPageRef.current = null;
+      pendingScrollBlockRef.current = null;
+      setPendingScrollTarget(null);
+      suppressObserverUntilRef.current = Date.now() + 250;
+    };
+
+    const frameOne = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => scrollToTarget(0));
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frameOne);
+      clearScrollRetryTimers();
+    };
+  }, [clearScrollRetryTimers, commitVisiblePage, pendingScrollTarget, pendingTargetStatus]);
 
   useEffect(() => {
     if (!goToTocItem?.page) return;
@@ -441,6 +568,8 @@ export function PdfHybridReader({
     lastJumpRef.current = target;
     pendingScrollPageRef.current = goToTocItem.page;
     pendingScrollBlockRef.current = null;
+    suppressObserverUntilRef.current = Date.now() + 1500;
+    setPendingScrollTarget({ page: goToTocItem.page, blockId: null, token: Date.now() });
     setMaxRequestedPage((current) => Math.max(current, Math.min(totalPages || goToTocItem.page!, goToTocItem.page! + 1)));
     void loadPage(goToTocItem.page);
   }, [goToTocItem, loadPage, totalPages]);
@@ -449,13 +578,11 @@ export function PdfHybridReader({
     if (!goToBlockTarget?.page) return;
     pendingScrollPageRef.current = goToBlockTarget.page;
     pendingScrollBlockRef.current = goToBlockTarget.blockId || null;
+    suppressObserverUntilRef.current = Date.now() + 1500;
+    setPendingScrollTarget({ page: goToBlockTarget.page, blockId: goToBlockTarget.blockId || null, token: goToBlockTarget.token });
     setMaxRequestedPage((current) => Math.max(current, Math.min(totalPages || goToBlockTarget.page, goToBlockTarget.page + 1)));
     void loadPage(goToBlockTarget.page);
   }, [goToBlockTarget, loadPage, totalPages]);
-
-  const sortedPages = useMemo(() => {
-    return Object.values(pages).sort((a, b) => a.page - b.page);
-  }, [pages]);
 
   const lineHeight = useMemo(() => preferredLineHeight || Math.max(1.55, Math.min(1.95, 1.86 - (fontSize - 18) * 0.01)), [fontSize, preferredLineHeight]);
 
@@ -592,11 +719,18 @@ export function PdfHybridReader({
         style={{ fontSize: `${fontSize}px`, lineHeight }}
         onMouseUp={handleTextSelection}
       >
-        <div className="pdf-text-mode-note pdf-hybrid-note">
-          <strong>Smart Reader</strong>
-          <span>
-            Texto refluido para leer cómodo. Las tablas, figuras o bloques complejos se preservan como recortes del PDF original.
-          </span>
+        <div className="pdf-hybrid-reader-hud">
+          <div className="pdf-text-mode-note pdf-hybrid-note">
+            <strong>Smart Reader</strong>
+            <span>
+              Texto refluido para leer cómodo. Las tablas, figuras o bloques complejos se preservan como recortes del PDF original.
+            </span>
+          </div>
+          {totalPages > 0 ? (
+            <div className="pdf-hybrid-page-indicator" aria-live="polite">
+              Página {currentPage} / {totalPages}
+            </div>
+          ) : null}
         </div>
 
         {loadingDocument ? <div className="pdf-text-loading">Preparando Smart Reader…</div> : null}

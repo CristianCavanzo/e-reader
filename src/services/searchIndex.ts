@@ -1,5 +1,5 @@
 import JSZip from 'jszip';
-import { db, type BookFormat } from '../db';
+import { db, type BookFormat, type SearchIndexEntry } from '../db';
 import { pdfjsLib } from '../lib/pdfWorker';
 
 function stripHtml(html: string) {
@@ -33,7 +33,7 @@ export async function clearSearchIndex(bookId: string) {
 export async function indexPdfText(bookId: string, file: Blob) {
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-  const rows = [];
+  const rows: SearchIndexEntry[] = [];
 
   try {
     for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
@@ -87,7 +87,7 @@ export async function indexEpubText(bookId: string, file: Blob) {
     if (id && href) manifest.set(id, joinPath(opfBase, href));
   });
 
-  const rows = [];
+  const rows: SearchIndexEntry[] = [];
   const spineItems = Array.from(opfDoc.querySelectorAll('spine itemref'));
   for (let index = 0; index < spineItems.length; index += 1) {
     const idref = spineItems[index].getAttribute('idref');
